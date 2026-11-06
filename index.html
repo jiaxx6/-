@@ -47,6 +47,8 @@
     display:flex;flex-direction:column;align-items:center;
     opacity:0;transform:translateY(-6px);transition:opacity 1.1s ease,transform 1.1s ease}
   #title.show{opacity:1;transform:none}
+  /* 只有走爆炸流程时才让计时器让位（body.bang 由 celebrate/hideTitle 控制） */
+  body.bang #title{opacity:0;transform:translateY(-6px)}
   /* 字后面一层极淡的柔光：照片飘到这一带也不会糊在一起 */
   #title::before{content:"";position:absolute;left:50%;top:50%;z-index:-1;
     transform:translate(-50%,-50%);
@@ -211,6 +213,7 @@
     <div id="title"><p></p></div>
     <div id="bottom">
       <button id="celebrate" type="button">Celebrate</button>
+      <p id="hint"></p>
     </div>
 
   </div>
@@ -1482,15 +1485,17 @@
     /* 标题 + 计时器：跟着爱心的出现和收起自己淡入淡出 */
     var titleTimer = null, titleOn = false;
 
+    /* 计时器的显隐只由「是不是在爆炸流程里」决定：
+       .show 从启动就加上、再也不摘掉，爆炸时给 body 加 .bang 让它淡出，
+       回到 idle 再摘掉 .bang。这样它不会被任何一帧的状态判断顺手关掉。 */
     function showTitle() {
-      if (titleOn) return;
       titleOn = true;
       ui.title.classList.add("show");
+      document.body.classList.remove("bang");
     }
     function hideTitle() {
       titleOn = false;
-      if (titleTimer) { clearTimeout(titleTimer); titleTimer = null; }
-      ui.title.classList.remove("show");
+      document.body.classList.add("bang");
     }
 
     var preGather = false, preT = 0;
@@ -1512,6 +1517,37 @@
       }
     }
 
+    /* 点 celebrate：不管现在转到正面、侧面还是背面，镜头先平滑转回正面，再开始汇聚 */
+    function cancelTween(obj, key) {
+      for (var i = scalarTweens.length - 1; i >= 0; i--) {
+        if (scalarTweens[i].obj === obj && scalarTweens[i].key === key) scalarTweens.splice(i, 1);
+      }
+    }
+    function swingToFront(dur) {
+      var delta = (-heartYaw) - orbit.theta;
+      delta = Math.atan2(Math.sin(delta), Math.cos(delta));  // 走最短的那一边
+      cancelTween(orbit, "theta");
+      cancelTween(orbit, "phi");
+      tweenValue(orbit, "theta", orbit.theta + delta, dur, easeInOutCubic);
+      tweenValue(orbit, "phi", 0.05, dur, easeInOutCubic);
+      orbit.auto = false;        // 汇聚期间别再自己慢慢转
+      orbit.lastInteract = time;
+    }
+
+    /* 爱心刚成型的那一下把镜头摆正：不管是滚轮、双指捏合还是长按聚起来的，
+       都不希望看到一颗斜着的心。摆正之后你再拖动视角完全自由。 */
+    var facedForm = false;
+    function updateHeartFacing() {
+      if (convergeCur > 0.86 && !facedForm) {
+        facedForm = true;
+        if (state === "idle" && !preGather) swingToFront(900);
+      } else if (convergeCur < 0.40) {
+        // 散开之后恢复自动慢转
+        facedForm = false;
+        orbit.auto = true;
+      }
+    }
+
     /* 点 celebrate：照片先慢慢汇成爱心，再开始缩点 */
     function celebrate() {
       if (state !== "idle" || preGather) return;
@@ -1519,6 +1555,7 @@
       uiFade(false);
       hideTitle();
       if (converge > 0.985) { beginCollapse(); return; }
+      swingToFront(1100);        // 先在 1.1 秒内转回正面
       preGather = true;
       preT = 0;
       G.floatW = 1;
@@ -1691,8 +1728,10 @@
 
       schedule(CONFIG.timing.back + 120, function () {
         resetOrbitFromCamera();
+        orbit.auto = true;    // 回到初始状态后恢复自动慢转
         uiFade(true);
         state = "idle";
+        showTitle();          // 回到初始状态，计时器跟着回来
       });
     }
 
@@ -1999,6 +2038,7 @@
       time += dt;
 
       convergeCur += (converge - convergeCur) * Math.min(1, dt * 2.1);
+      updateHeartFacing();
       advancePreGather(dt);
       // 手机/触屏：按住不动，持续汇聚
       if (dragging && moved < 9 && state === "idle") {
@@ -2020,8 +2060,7 @@
       updateHeartHalo(dt);
       updateParticles(dt);
 
-      if (state === "idle" && !preGather && convergeCur > 0.55) showTitle();
-      else if (convergeCur < 0.42 && titleOn) hideTitle();
+      // 计时器常驻：显隐交给 body.bang（见 showTitle/hideTitle），这里不再每帧开关
 
 
       if (G.dotShake > 0.001 && glow) {
@@ -2042,16 +2081,53 @@
     var raycaster = new THREE.Raycaster();
     var ndc = new THREE.Vector2();
 
+    /* 双指捏合：两指张开 = 汇聚成爱心，两指收拢 = 散开
+       手机上主用这个手势（按住不动也行，但太慢） */
+    var touches = {}, pinchPrev = 0, pinching = false;
+    function pinchDist() {
+      var ids = Object.keys(touches);
+      if (ids.length < 2) return 0;
+      var a = touches[ids[0]], b = touches[ids[1]];
+      var dx = a.x - b.x, dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    function track(e, add) {
+      if (add) touches[e.pointerId] = { x: e.clientX, y: e.clientY };
+      else delete touches[e.pointerId];
+    }
+
     canvas.addEventListener("pointerdown", function (e) {
       if (state !== "idle") return;
+      track(e, true);
+      if (Object.keys(touches).length >= 2) {
+        // 第二根手指按下：进入捏合，取消拖动和长按，别再触发点开照片
+        pinching = true; dragging = false; holding = false; moved = 999;
+        pinchPrev = pinchDist();
+        document.body.classList.remove("dragging");
+        return;
+      }
       dragging = true; moved = 0; holding = false;
       pressAt = time;
       lastX = e.clientX; lastY = e.clientY;
       document.body.classList.add("dragging");
-      if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+      try { if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId); } catch (err) {}
     });
 
     canvas.addEventListener("pointermove", function (e) {
+      if (touches[e.pointerId]) touches[e.pointerId] = { x: e.clientX, y: e.clientY };
+      if (pinching) {
+        var d = pinchDist();
+        if (pinchPrev > 6 && d > 6 && state === "idle") {
+          var ratio = d / pinchPrev;
+          if (Math.abs(ratio - 1) > 0.0015) {
+            // 用对数比例，跟事件频率无关：两指距离翻倍约等于汇聚满格
+            converge = clamp(converge + Math.log(ratio) * 1.6, 0, 1);
+            orbit.lastInteract = time;
+          }
+        }
+        pinchPrev = d;
+        return;
+      }
       if (!dragging) return;
       var dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
@@ -2061,12 +2137,16 @@
       orbit.lastInteract = time;
     });
 
-    window.addEventListener("pointerup", function (e) {
+    function endPointer(e) {
+      track(e, false);
+      if (Object.keys(touches).length < 2) { pinching = false; pinchPrev = 0; }
       if (!dragging) return;
       dragging = false;
       document.body.classList.remove("dragging");
       if (moved < 9 && !holding) handleClick(e);
-    });
+    }
+    window.addEventListener("pointerup", endPointer);
+    window.addEventListener("pointercancel", endPointer);
 
     canvas.addEventListener("wheel", function (e) {
       if (state !== "idle") return;
@@ -2130,6 +2210,39 @@
       celebrate();
     });
 
+    // 底部小提示：手机上教一下手势，桌面上说滚轮
+    (function () {
+      var hint = document.getElementById("hint");
+      if (!hint) return;
+      var coarse = window.matchMedia && window.matchMedia("(pointer:coarse)").matches;
+      hint.textContent = coarse ? "双指张开 · 汇聚成爱心" : "滚轮向下 · 汇聚成爱心";
+    })();
+
+    // 调试用：?dbg=1 时暴露汇聚度，方便自动测试
+    if (/[?&]dbg=1/.test(location.search)) {
+      window.__conv = function () { return converge; };
+      window.__convSet = function (v) { converge = v; };
+      window.__show = showTitle;
+      window.__hide = hideTitle;
+      window.__state = function () { return state; };
+      window.__orbit = function () { return { theta: orbit.theta, phi: orbit.phi, radius: orbit.radius, auto: orbit.auto }; };
+      window.__cam = function () { return { x: camera.position.x, y: camera.position.y, z: camera.position.z }; };
+      window.__spin = function (a, p) { orbit.theta = a; if (p !== undefined) orbit.phi = p; };
+      // 手动推进模拟时间：自动化测试用（headless 里 rAF 不一定跑）
+      window.__tick = function (n) {
+        for (var i = 0; i < n; i++) {
+          time += 0.016;
+          convergeCur += (converge - convergeCur) * Math.min(1, 0.016 * 2.1);
+          updateHeartFacing();
+          advancePreGather(0.016);
+          updateScalarTweens();
+          updateCamAnim();
+          updateCamera(0.016);
+        }
+        return { theta: orbit.theta, z: camera.position.z, conv: converge, cur: convergeCur, x: camera.position.x };
+      };
+    }
+
     window.addEventListener("keydown", function (e) {
       if (state === "note") {
         if (e.key === "Escape" || e.key === " " || e.key === "Enter") { e.preventDefault(); closeNote(); }
@@ -2189,6 +2302,7 @@
       buildConfetti();
       buildScraps();
       startTicker();
+      showTitle();
 
       if (pending <= 0) maybeHideLoader();
       setTimeout(maybeHideLoader, 2000);
